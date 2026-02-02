@@ -1,0 +1,4 @@
+name,type,capacity,speed,discharge_rate
+Speedy,Speedster,2.0,3.0,2.0
+Steady,Standard,5.0,2.0,3.0
+Sturdy,Heavy,10.0,1.0,5.0

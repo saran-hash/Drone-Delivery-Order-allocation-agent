@@ -1,0 +1,6 @@
+order_id,description,mass,x,y,request_tick
+2001,"[Standard] Light Document",0.5,5,5,0
+2002,"[Medical] Supplies",2.0,-10,12,0
+2003,"[Heavy] Equipment",8.0,15,-5,5
+2004,"[Express] Parcel",1.5,-3,-18,10
+2005,"[Standard] Grocery Bag",4.0,12,12,15
