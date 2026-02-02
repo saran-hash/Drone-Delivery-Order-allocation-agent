@@ -52,7 +52,7 @@ def main():
     print(f"--- Mission Started: Agent {agent.name} controlling {len(fleet_config)} drones ---")
 
     try:
-        max_ticks = 5
+        max_ticks = 100
         for t in range(max_ticks):
             # Inject orders scheduled for this tick
             for order in all_orders:
