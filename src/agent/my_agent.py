@@ -1,316 +1,180 @@
 import math
 import json
+import random
+import re
+import requests
 import os
-from typing import Dict, List, Any, Tuple
+from typing import Dict, List, Any, Optional
 from dotenv import load_dotenv
-from groq import Groq
+from pydantic import BaseModel, Field
+from pydantic_ai import Agent, PromptedOutput  
 
 load_dotenv()
 
-# =========================
-# MCP (TOOLS)
-# =========================
+# Pydantic Models (bulletproof JSON parsing)
+class ParsedOrder(BaseModel):
+    id: int
+    prio: str
+    mass: float
+    dest: List[float]
+    tick: int
+
+class HighPriorityOrders(BaseModel):
+    high_priority: List[ParsedOrder]
+
+class Assignments(BaseModel):
+    assignments: Dict[str, Dict[str, Any]]
+
+class AuditResult(BaseModel):
+    validations: Dict[str, Dict[str, Any]]
+
+class FinalActions(BaseModel):
+    actions: Dict[str, Dict[str, Any]]
+
+class A2AMessage:
+    def __init__(self, sender: str, receiver: str, method: str, params: Dict, result: Optional[Dict] = None):
+        self.envelope = {
+            "jsonrpc": "2.0", "sender": sender, "receiver": receiver,
+            "method": method, "params": params, "id": random.randint(1000, 9999)
+        }
+        if result is not None:
+            self.envelope["result"] = result
+    def to_json(self): return json.dumps(self.envelope)
+
 class KovaiMCPServer:
     @staticmethod
-    def calculate_distance(pos1: Tuple[float, float], pos2: Tuple[float, float]) -> float:
-        """Calculate Euclidean distance between two positions."""
-        return math.sqrt((pos1[0] - pos2[0]) ** 2 + (pos1[1] - pos2[1]) ** 2)
-
+    def calculate_distance(pos1, pos2):
+        return math.sqrt((pos1[0]-pos2[0])**2 + (pos1[1]-pos2[1])**2)
+    
     @staticmethod
-    def estimate_battery_cost(distance: float, discharge_rate: float, load: float = 0) -> float:
-        """
-        Estimate battery cost for a trip.
-        Formula: distance * discharge_rate * (1 + load_factor)
-        """
-        load_factor = 1.0 + (load * 0.1)  # 10% extra battery per kg of load
-        return distance * discharge_rate * load_factor
+    def energy_to_target(drone_info: Dict, target_pos: tuple, reserve: float = 0.1) -> float:
+        dist = KovaiMCPServer.calculate_distance(target_pos, (0,0))
+        ticks = dist / drone_info['speed']
+        return drone_info['discharge_rate'] * ticks * 1.1 + reserve
 
-    @staticmethod
-    def is_reachable(battery: float, distance: float, discharge_rate: float, 
-                     load: float = 0, safety_buffer: float = 1.2) -> bool:
-        """
-        Check if drone can reach destination and return to hub with safety buffer.
-        Round trip = distance * 2 (to dest and back)
-        """
-        round_trip_cost = KovaiMCPServer.estimate_battery_cost(
-            distance * 2, discharge_rate, load
-        ) * safety_buffer
-        return battery > round_trip_cost
+# PydanticAI Agents (JSON parsing FIXED)
+order_analyst = Agent(
+    "groq:llama-3.1-8b-instant",
+    instructions=(
+        "Return ONLY valid JSON matching HighPriorityOrders.\n"
+        "Schema: {\"high_priority\": [{\"id\": int, \"prio\": str, \"mass\": float, \"dest\": [float,float], \"tick\": int}]}\n"
+        "Extract tags from [TAG] in text. Sort by priority then request_tick. Return exactly 5 items if available.\n"
+        "DO NOT add extra keys or text."
+    ),
+    output_type=PromptedOutput(HighPriorityOrders),
+    output_retries=3
+)
 
+resource_allocator = Agent(
+    "groq:llama-3.1-8b-instant",
+    instructions=(
+        "Return ONLY valid JSON matching Assignments.\n"
+        "Schema: {\"assignments\": {\"Drone_000\": {\"order_id\": int, \"reason\": str}}}\n"
+        "Keys MUST be drone names (e.g., Drone_000). Values MUST contain order_id and reason only.\n"
+        "Match by capacity: Speedster≤2kg, Standard≤5kg, Heavy≤10kg. Minimize capacity waste.\n"
+        "DO NOT add extra keys or text."
+    ),
+    output_type=PromptedOutput(Assignments),
+    output_retries=3
+)
 
-# =========================
-# LLM SETUP (GROQ)
-# =========================
-groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+safety_auditor = Agent(
+    "groq:llama-3.1-8b-instant",
+    instructions=(
+        "Return ONLY valid JSON matching AuditResult.\n"
+        "Schema: {\"validations\": {\"Drone_000\": {\"approved\": true/false, \"reason\": str}}}\n"
+        "Validate battery: battery >= (dist/speed*discharge*1.1)+0.1.\n"
+        "DO NOT add extra keys or text."
+    ),
+    output_type=PromptedOutput(AuditResult),
+    output_retries=3
+)
 
-def call_llm_for_decisions(state_summary: str) -> Dict[str, Any]:
-    """
-    Call LLM to make tactical decisions for drone actions.
-    Returns structured JSON with action recommendations.
-    """
-    try:
-        prompt = f"""
-You are a logistics dispatcher AI. Analyze the current fleet state and recommend actions.
+dispatcher = Agent(
+    "groq:llama-3.1-8b-instant",
+    instructions=(
+        "Return ONLY valid JSON matching FinalActions.\n"
+        "Schema: {\"actions\": {\"Drone_000\": {\"action\": \"WAIT|MOVE|PICKUP|DELIVER\", \"params\": {}}}}\n"
+        "Use actions: IDLE→PICKUP→MOVE→DELIVER→RTB.\n"
+        "DO NOT add extra keys or text."
+    ),
+    output_type=PromptedOutput(FinalActions),
+    output_retries=3
+)
 
-CONSTRAINTS AND RULES:
-1. DRONE PHYSICS:
-   - Each drone has a battery (0-100%)
-   - Battery drains: distance * discharge_rate per unit traveled
-   - discharge rate was given for each drone
-   - Battery cannot go below 0 (drone crashes)
-   - Charging  adds 10% battery per tick while traveling
-
-2. DELIVERY RULES:
-   - Orders can only be picked up at hub (0,0)
-   - Drone must have enough capacity:  order_mass <= capacity
-   - Drone must have enough battery for round trip to delivery location and back
-   - PICKUP action: Drone at hub, picks up order
-   - MOVE action: Drone moves toward destination
-   - DELIVER action: Drone at delivery location, drops package
-
-
-
-4. PRIORITIES:
-   - Medical orders: HIGHEST priority
-   - Urgent orders: HIGH priority
-   - Standard orders: NORMAL priority
-   - Never leave drones at 0% battery (CRASH)
-   
-
-CURRENT STATE:
-{state_summary}
-
-TASK:
-For each IDLE drone with available orders:
-1. Recommend ONE action: PICKUP, MOVE, CHARGE, or WAIT
-2. If PICKUP: specify order_id
-3. If MOVE: specify target coordinates
-4. Ensure all recommendations are physically feasible
-
-Return ONLY valid JSON:
-{{
-    "actions": [
-        {{"drone_id": "Speedy", "action": "MOVE", "target": [5, 5]}},
-        {{"drone_id": "Steady", "action": "CHARGE"}}
-    ]
-}}
-"""
-        completion = groq_client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You are a logistics AI. Output ONLY valid JSON. No markdown. No explanations. No code blocks."
-                },
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.3,
-            max_tokens=1000,
-        )
-        
-        response_text = completion.choices[0].message.content.strip()
-        # Remove markdown code blocks if present
-        if "```json" in response_text:
-            response_text = response_text.split("```json")[1].split("```")[0].strip()
-        elif "```" in response_text:
-            response_text = response_text.split("```")[1].split("```")[0].strip()
-        
-        return json.loads(response_text)
-    except Exception as e:
-        print(f"⚠️ LLM decision call failed: {e}")
-        return {"actions": []}
-
-
-# =========================
-# AGENT LOGIC
-# =========================
-class KovaiOrchestrator:
-    def __init__(self):
+class MultiAgentOrchestrator:
+    def __init__(self, groq_key: str):
         self.mcp = KovaiMCPServer()
-        self.drone_targets: Dict[str, Dict] = {}  # Track active delivery targets
-        self.memory: Dict[str, Any] = {}  # Persistent memory across ticks
-
-    def orchestrate(self, state: Dict[str, Any]) -> Dict[str, Dict]:
-        """
-        Main orchestration logic. Returns actions for each drone.
-        """
-        actions = {}
+        self.api_key = groq_key
+        self.state_memory = {}
+    
+    def orchestrate(self, state: Dict) -> Dict[str, Dict]:
+        drones = state['drones']
+        pending_orders = state['pending_orders']
+        messages = []
         
         try:
-            # Extract state
-            drones = state.get('drones', {})
-            pending_orders = state.get('pending_orders', [])
-            weather = state.get('weather', 'CLEAR')
-            tick = state.get('tick', 0)
+            # 1. Order Analyst (PydanticAI auto-parses JSON)
+            high_prio_raw = order_analyst.run_sync(
+                f"Analyze {len(pending_orders)} orders: {json.dumps(pending_orders[:20])}"
+            )
+            high_prio: HighPriorityOrders = HighPriorityOrders.model_validate(high_prio_raw.output)
+            msg1 = A2AMessage("Analyst", "Allocator", "high_priority_orders", high_prio.model_dump())
+            messages.append(msg1)
             
-            # Get weather multiplier for battery calculations
-            weather_mult = {
-                'CLEAR': 1.0,
-                'WINDY': 1.2,
-                'STORMY': 1.5
-            }.get(weather, 1.0)
+            # 2. Resource Allocator
+            available = [v for v in drones.values() if v['status']=='IDLE' and v['pos']==(0,0) and v['load']==0]
+            assignments_raw = resource_allocator.run_sync(
+                f"High prio ({len(high_prio.high_priority)}): {high_prio.model_dump_json()}\nAvailable ({len(available)}): {json.dumps(available[:10])}"
+            )
+            assignments: Assignments = Assignments.model_validate(assignments_raw.output)
+            msg2 = A2AMessage("Allocator", "Auditor", "proposed_assignments", assignments.model_dump())
+            messages.append(msg2)
             
-            # ========== PHASE 1: HANDLE MOVING DRONES ==========
-            for drone_id, drone_info in drones.items():
-                status = drone_info.get('status', 'IDLE')
-                
-                if status == 'IN_TRANSIT':
-                    # Continue to current target
-                    target = self.drone_targets.get(drone_id)
-                    if target:
-                        dest = target.get('dest') or target.get('destination')
-                        if dest:
-                            actions[drone_id] = {
-                                "action": "MOVE",
-                                "params": {"target": list(dest)}
-                            }
+            # 3. Safety Auditor
+            naive_actions = {k: {"action": "MOVE", "params": {"target": (0,0)}} for k in list(drones)[:20]}
+            audit_raw = safety_auditor.run_sync(
+                f"Actions: {json.dumps(naive_actions)}\nDrones sample: {json.dumps(list(drones.values())[:10])}"
+            )
+            audit: AuditResult = AuditResult.model_validate(audit_raw.output)
+            msg3 = A2AMessage("Auditor", "Dispatcher", "safety_validations", audit.model_dump())
+            messages.append(msg3)
             
-            # ========== PHASE 2: HANDLE DELIVERY COMPLETION & MOVEMENT WITH CARGO ==========
-            for drone_id, drone_info in drones.items():
-                status = drone_info.get('status', 'IDLE')
-                
-                if status == 'IDLE' and drone_info.get('load', 0) > 0:
-                    # Drone has cargo - either move to delivery or deliver if arrived
-                    target = self.drone_targets.get(drone_id)
-                    if target:
-                        dest = target.get('dest') or target.get('destination')
-                        if dest:
-                            dist = self.mcp.calculate_distance(drone_info['pos'], dest)
-                            if dist < 1.0:
-                                # Arrived at delivery location - DELIVER
-                                actions[drone_id] = {
-                                    "action": "DELIVER",
-                                    "params": {}
-                                }
-                                self.drone_targets.pop(drone_id, None)
-                            else:
-                                # Not yet arrived - MOVE to delivery location
-                                actions[drone_id] = {
-                                    "action": "MOVE",
-                                    "params": {"target": list(dest)}
-                                }
+            # 4. Tactical Dispatcher (FINAL)
+            actions_raw = dispatcher.run_sync(
+                f"Assignments: {assignments.model_dump_json()}\nAudit: {audit.model_dump_json()}\nDrones: {json.dumps(list(drones.values())[:10])}\nMemory: {self.state_memory}"
+            )
+            final_actions: FinalActions = FinalActions.model_validate(actions_raw.output)
+            actions = final_actions.actions
+
+            # Ensure MOVE actions have a valid target
+            for d_id, act in actions.items():
+                if act.get("action") == "MOVE":
+                    params = act.get("params") or {}
+                    if params.get("target") is None:
+                        params["target"] = [0, 0]
+                        act["params"] = params
             
-            # ========== PHASE 3: ASSIGN NEW ORDERS TO IDLE DRONES ==========
-            idle_drones = [
-                (d_id, d_info) 
-                for d_id, d_info in drones.items() 
-                if d_info.get('status') == 'IDLE' and d_info.get('load', 0) == 0
-            ]
-            
-            if idle_drones and pending_orders:
-                # Build state summary for LLM (limited size)
-                summary = self._build_state_summary(
-                    idle_drones[:],  # Only top 5 idle drones
-                    pending_orders[:],  # Only top 5 pending orders
-                    weather,
-                    tick
-                )
-                
-                # Get LLM recommendations
-                llm_response = call_llm_for_decisions(summary)
-                llm_actions = llm_response.get('actions', [])
-                
-                # Apply LLM recommendations
-                for llm_action in llm_actions:
-                    drone_id = llm_action.get('drone_id')
-                    action = llm_action.get('action', '').upper()
-                    
-                    if drone_id not in drones:
-                        continue
-                    
-                    if action == 'PICKUP':
-                        order_id = llm_action.get('order_id')
-                        order = next(
-                            (o for o in pending_orders if o.get('id') == order_id),
-                            None
-                        )
-                        if order:
-                            # Verify constraints
-                            drone = drones[drone_id]
-                            if order.get('mass', 0) <= drone.get('capacity', 0):
-                                actions[drone_id] = {
-                                    "action": "PICKUP",
-                                    "params": {"order_id": order_id}
-                                }
-                                # Remember target for later
-                                self.drone_targets[drone_id] = order
-                    
-                    elif action == 'MOVE':
-                        target = llm_action.get('target', [0, 0])
-                        actions[drone_id] = {
-                            "action": "MOVE",
-                            "params": {"target": target}
-                        }
-                    
-                    elif action == 'CHARGE':
-                        actions[drone_id] = {
-                            "action": "MOVE",
-                            "params": {"target": [0, 0]}
-                        }
-            
-            # ========== PHASE 4: DEFAULT ACTIONS FOR UNHANDLED DRONES ==========
-            for drone_id, drone_info in drones.items():
-                if drone_id not in actions:
-                    status = drone_info.get('status', 'IDLE')
-                    battery = drone_info.get('bat', 0)
-                    
-                    if status == 'CRASHED':
-                        pass  # No action for crashed drones
-                    elif battery < 20:
-                        # Low battery - go to hub and charge
-                        actions[drone_id] = {
-                            "action": "MOVE",
-                            "params": {"target": [0, 0]}
-                        }
-                    elif status == 'IDLE':
-                        # WAIT at current position
-                        actions[drone_id] = {
-                            "action": "WAIT",
-                            "params": {}
-                        }
-            
-            return actions
+            # Update memory
+            self.state_memory.update({k: v for k, v in actions.items() if 'order_id' in v.get('params', {})})
             
         except Exception as e:
-            print(f"⚠️ Orchestrator error: {e}")
-            return {}
-
-    def _build_state_summary(self, idle_drones: List, pending_orders: List, 
-                            weather: str, tick: int) -> str:
-        """Build a concise summary of state for LLM."""
-        drone_list = []
-        for drone_id, drone_info in idle_drones:
-            drone_list.append({
-                "id": drone_id,
-                "battery": round(drone_info.get('bat', 0), 1),
-                "capacity": drone_info.get('capacity', 0),
-                "speed": drone_info.get('speed', 0),
-                "pos": list(drone_info.get('pos', [0, 0]))
-            })
+            print(f"Agent fallback RTB: {e}")
+            actions = {list(drones.keys())[i % len(drones)]: {"action": "MOVE", "params": {"target": (0,0)}} 
+                      for i in range(min(10, len(drones)))}
         
-        order_list = []
-        for order in pending_orders[:5]:
-            dest = order.get('dest') or order.get('destination')
-            order_list.append({
-                "id": order.get('id'),
-                "mass": order.get('mass', 0),
-                "dest": list(dest) if dest else [0, 0],
-                "priority": "MEDICAL" if "Medical" in order.get('text', '') else "STANDARD"
-            })
+        # A2A to Engine
+        engine_msg = A2AMessage("Orchestrator", "Engine", "final_actions", {"actions": actions})
+        print(json.dumps([m.to_json() for m in messages] + [engine_msg.to_json()], indent=2))
         
-        return json.dumps({
-            "tick": tick,
-            "weather": weather,
-            "available_drones": drone_list,
-            "available_orders": order_list
-        }, indent=2)
-
+        return actions
 
 class KovaiAgent:
-    def __init__(self):
-        self.orchestrator = KovaiOrchestrator()
-        self.name = "AI_Agent"
-
-    def decide(self, state: Dict[str, Any]) -> Dict[str, Dict]:
-        """Main entry point for agent decision-making."""
+    def __init__(self, groq_key: str = None):
+        if groq_key is None:
+            groq_key = os.getenv("GROQ_API_KEY", "")
+        self.name = "KovaiAgent"
+        self.orchestrator = MultiAgentOrchestrator(groq_key)
+    
+    def decide(self, state):
         return self.orchestrator.orchestrate(state)
